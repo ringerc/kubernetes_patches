@@ -22,6 +22,10 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+	"strconv"
+	"os"
+	"io"
+	"errors"
 
 	"github.com/spf13/cobra"
 
@@ -35,21 +39,74 @@ import (
 	"k8s.io/kubectl/pkg/scheme"
 )
 
+const LOCAL_PORT_OFFSET = 5
+
 type fakePortForwarder struct {
 	method string
 	url    *url.URL
 	pfErr  error
+	ports []string
+	mappedPorts []forwardedPort
 }
 
 func (f *fakePortForwarder) ForwardPorts(method string, url *url.URL, opts PortForwardOptions) error {
 	f.method = method
 	f.url = url
+	close(opts.ReadyChannel)
+	if f.pfErr == nil {
+		var err error
+		f.mappedPorts, err = fakePortMapping(f.ports)
+		if err != nil {
+			return err
+		}
+	}
 	return f.pfErr
 }
 
-func testPortForward(t *testing.T, flags map[string]string, args []string) {
+func (f *fakePortForwarder) GetPorts() ([]forwardedPort, error) {
+	if f.pfErr != nil {
+		return []forwardedPort{}, fmt.Errorf("not Ready")
+	}
+	return f.mappedPorts, nil
+}
+
+// fake up a mapping of allocated ports, since we're not really forwarding
+// anything at all. This doesn't have to handle string port mappings and
+// doesn't have to realistically emulate local random port assignment, it just
+// has to return something that could be a realistic result from the input port
+// mappings.
+func fakePortMapping(ports []string) ([]forwardedPort, error) {
+	fp := make([]forwardedPort, len(ports))
+	for i, p := range ports {
+		lps, rps := splitPort(p)
+		var err error
+		rp, err := strconv.Atoi(rps)
+		fp[i].Remote = uint16(rp)
+		if err != nil {
+			return []forwardedPort{}, err
+		}
+		if lps == "" {
+			// To avoid random local port allocation in tests just
+			// assume it's local port with arbitrary offset
+			fp[i].Local = fp[i].Remote + LOCAL_PORT_OFFSET
+		} else {
+			lp, err := strconv.Atoi(lps)
+			if err != nil {
+				return []forwardedPort{}, err
+			}
+			fp[i].Local = uint16(lp)
+		}
+	}
+	return fp, nil
+}
+
+type testchecks func (t *testing.T, opts *PortForwardOptions, fakeForwarder *fakePortForwarder)
+
+func testPortForward(t *testing.T, args []string, allerr bool, expectPorts []forwardedPort, extrachecks testchecks) {
 	version := "v1"
 
+	podPath := "/api/" + version + "/namespaces/test/pods/foo"
+	pfPath := "/api/" + version + "/namespaces/test/pods/foo/portforward"
 	tests := []struct {
 		name            string
 		podPath, pfPath string
@@ -58,20 +115,33 @@ func testPortForward(t *testing.T, flags map[string]string, args []string) {
 	}{
 		{
 			name:    "pod portforward",
-			podPath: "/api/" + version + "/namespaces/test/pods/foo",
-			pfPath:  "/api/" + version + "/namespaces/test/pods/foo/portforward",
+			podPath: podPath,
+			pfPath:  pfPath,
 			pod:     execPod(),
+			pfErr:   allerr,
 		},
 		{
 			name:    "pod portforward error",
-			podPath: "/api/" + version + "/namespaces/test/pods/foo",
-			pfPath:  "/api/" + version + "/namespaces/test/pods/foo/portforward",
+			podPath: podPath,
+			pfPath:  pfPath,
 			pod:     execPod(),
 			pfErr:   true,
 		},
 	}
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			if err := os.Chdir(t.TempDir()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func () {
+				if err = os.Chdir(origDir); err != nil {
+					t.Fatal(err)
+				}
+			})
 			var err error
 			tf := cmdtesting.NewTestFactory().WithNamespace("test")
 			defer tf.Cleanup()
@@ -95,16 +165,20 @@ func testPortForward(t *testing.T, flags map[string]string, args []string) {
 				}),
 			}
 			tf.ClientConfigVal = cmdtesting.DefaultClientConfig()
-			ff := &fakePortForwarder{}
-			if test.pfErr {
-				ff.pfErr = fmt.Errorf("pf error")
-			}
 
-			opts := &PortForwardOptions{}
-			cmd := NewCmdPortForward(tf, genericiooptions.NewTestIOStreamsDiscard())
+			discardStreams := genericiooptions.NewTestIOStreamsDiscard()
+			opts := &PortForwardOptions{IOStreams: discardStreams}
+			cmd := NewCmdPortForwardWithOpts(tf, discardStreams, opts)
+			var ff *fakePortForwarder
 			cmd.Run = func(cmd *cobra.Command, args []string) {
 				if err = opts.Complete(tf, cmd, args); err != nil {
 					return
+				}
+				ff = &fakePortForwarder{
+					ports: opts.Ports,
+				}
+				if test.pfErr {
+					ff.pfErr = fmt.Errorf("pf error")
 				}
 				opts.PortForwarder = ff
 				if err = opts.Validate(); err != nil {
@@ -112,13 +186,10 @@ func testPortForward(t *testing.T, flags map[string]string, args []string) {
 				}
 				err = opts.RunPortForward()
 			}
+			cmd.SetArgs(args)
+			cmd.Execute()
 
-			for name, value := range flags {
-				cmd.Flags().Set(name, value)
-			}
-			cmd.Run(cmd, args)
-
-			if test.pfErr && err != ff.pfErr {
+			if test.pfErr && ff != nil && err != ff.pfErr {
 				t.Errorf("%s: Unexpected port-forward error: %v", test.name, err)
 			}
 			if !test.pfErr && err != nil {
@@ -134,12 +205,94 @@ func testPortForward(t *testing.T, flags map[string]string, args []string) {
 			if ff.method != "POST" {
 				t.Errorf("%s: Did not get method for attach request: %s", test.name, ff.method)
 			}
+			if !reflect.DeepEqual(ff.mappedPorts, expectPorts) {
+				t.Errorf("%s: mapped ports %v did not match expected %v", test.name, ff.mappedPorts, expectPorts)
+			}
+			if extrachecks != nil {
+				extrachecks(t, opts, ff)
+			}
 		})
 	}
 }
 
 func TestPortForward(t *testing.T) {
-	testPortForward(t, nil, []string{"foo", ":5000", ":1000"})
+	tests := []struct {
+		name            string
+		// if all sub-tests will fail due to invalid args etc
+		allerr          bool
+		args            []string
+		expectPorts     []forwardedPort
+		extrachecks     testchecks
+	}{
+		{
+			name: "basic-localmapped",
+			args: []string{"foo", ":5000", ":1000"},
+			expectPorts: []forwardedPort{
+					forwardedPort{Local: 5000 + LOCAL_PORT_OFFSET, Remote: 5000},
+					forwardedPort{Local: 1000 + LOCAL_PORT_OFFSET, Remote: 1000},
+				},
+		},
+		{
+			name: "basic-localexplicit",
+			args: []string{"foo", "5000:5000", "2000:1000"},
+			expectPorts: []forwardedPort{
+					forwardedPort{Local: 5000, Remote: 5000},
+					forwardedPort{Local: 2000, Remote: 1000},
+				},
+		},
+		{
+			name: "noports",
+			allerr: true,
+			args: []string{},
+			expectPorts: []forwardedPort{},
+		},
+		{
+			name: "noports",
+			allerr: true,
+			args: []string{"--invalid-argument"},
+			expectPorts: []forwardedPort{},
+		},
+		{
+			name: "ports-file-stdout",
+			args: []string{"--ports-file=-", "foo", ":5000", "2000:1000"},
+			expectPorts: []forwardedPort{
+					forwardedPort{Local: 5000 + LOCAL_PORT_OFFSET, Remote: 5000},
+					forwardedPort{Local: 2000, Remote: 1000},
+				},
+		},
+		{
+			name: "ports-file-path",
+			args: []string{"--ports-file=ports-file", "foo", ":5000", "2000:1000"},
+			expectPorts: []forwardedPort{
+					forwardedPort{Local: 5000 + LOCAL_PORT_OFFSET, Remote: 5000},
+					forwardedPort{Local: 2000, Remote: 1000},
+				},
+			extrachecks: func (t *testing.T, opts *PortForwardOptions, fakeForwarder *fakePortForwarder) {
+				f, err := os.Open("ports-file")
+				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						t.Errorf("expected file \"ports-file\" not found: %v", err)
+						return
+					}
+					t.Fatal(err)
+				}
+				defer f.Close()
+				portsFileContents, err := io.ReadAll(f)
+				if err != nil {
+					t.Fatal(err)
+				}
+				expectedPortsFile := `[{"Local":5005,"Remote":5000},{"Local":2000,"Remote":1000}]`+"\n"
+				if string(portsFileContents) != expectedPortsFile {
+					t.Errorf("contents of ports-file \"%s\" does not match expected value \"%s\"", string(portsFileContents), expectedPortsFile)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testPortForward(t, test.args, test.allerr, test.expectPorts, test.extrachecks)
+		})
+	}
 }
 
 func TestTranslateServicePortToTargetPort(t *testing.T) {
