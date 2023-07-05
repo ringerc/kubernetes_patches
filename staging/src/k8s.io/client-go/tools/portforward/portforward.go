@@ -43,6 +43,7 @@ var ErrLostConnectionToPod = errors.New("lost connection to pod")
 // a remote pod via an upgraded HTTP request.
 type PortForwarder struct {
 	addresses []listenAddress
+	// Requested port forwards
 	ports     []ForwardedPort
 	stopChan  <-chan struct{}
 
@@ -54,12 +55,28 @@ type PortForwarder struct {
 	requestID     int
 	out           io.Writer
 	errOut        io.Writer
+	// Actual port bindings after dynamic local port assignments,
+	// with one entry per listenAddress where multiple listeners
+	// requested.
+	portMappings  []ForwardedPortMapping
 }
 
 // ForwardedPort contains a Local:Remote port pairing.
 type ForwardedPort struct {
 	Local  uint16
 	Remote uint16
+}
+
+// ForwardedPortMapping describes a port-forward including
+// the local bind port and address.
+type ForwardedPortMapping struct {
+	LocalPort uint16
+	// Local listener network protocol (address scheme) as used by the
+	// "net" package; will be "tcp", "tcp4" or "tcp6"
+	LocalProtocol string
+	// Local binding address
+	LocalAddress string
+	RemotePort uint16
 }
 
 /*
@@ -108,7 +125,11 @@ func parsePorts(ports []string) ([]ForwardedPort, error) {
 			return nil, fmt.Errorf("remote port must be > 0")
 		}
 
-		forwards = append(forwards, ForwardedPort{uint16(localPort), uint16(remotePort)})
+		forwards = append(forwards,
+			ForwardedPort{
+				Local: uint16(localPort),
+				Remote: uint16(remotePort),
+			})
 	}
 
 	return forwards, nil
@@ -286,10 +307,22 @@ func (pf *PortForwarder) getListener(protocol string, hostname string, port *For
 	localPortUInt, err := strconv.ParseUint(localPort, 10, 16)
 
 	if err != nil {
-		fmt.Fprintf(pf.out, "Failed to forward from %s:%d -> %d\n", hostname, localPortUInt, port.Remote)
+		fmt.Fprintf(pf.errOut, "Failed to forward from %s:%d -> %d\n", hostname, localPortUInt, port.Remote)
 		return nil, fmt.Errorf("error parsing local port: %s from %s (%s)", err, listenerAddress, host)
 	}
+	// This overwrites the port mapping with the assigned local port, but
+	// we might assign different local ports to different listening
+	// addresses so this is incorrect in any multi-listener case incuding
+	// the default listener of "localhost" on IPv4 and IPv6. It is retained
+	// for BC.
 	port.Local = uint16(localPortUInt)
+	// Record fully specified local listener
+	pf.portMappings = append(pf.portMappings, ForwardedPortMapping{
+			LocalPort: uint16(localPortUInt),
+			LocalAddress: host,
+			LocalProtocol: protocol,
+			RemotePort: port.Remote,
+		})
 	if pf.out != nil {
 		fmt.Fprintf(pf.out, "Forwarding from %s -> %d\n", net.JoinHostPort(hostname, strconv.Itoa(int(localPortUInt))), port.Remote)
 	}
@@ -426,6 +459,12 @@ func (pf *PortForwarder) Close() {
 // function will signal an error if the Ready channel is nil or if the
 // listeners are not ready yet; this function will succeed after the Ready
 // channel has been closed.
+//
+// If a different IPv4 and IPv6 port is assigned for a single port-forward, the
+// port mapping returned by this function will return whichever was assigned
+// last, so its output is only reliable when port-forwarding was explicitly
+// bound to either an IPv4 or IPv6 local address. Use GetPortMappings() for
+// more complete information.
 func (pf *PortForwarder) GetPorts() ([]ForwardedPort, error) {
 	if pf.Ready == nil {
 		return nil, fmt.Errorf("no Ready channel provided")
@@ -433,6 +472,24 @@ func (pf *PortForwarder) GetPorts() ([]ForwardedPort, error) {
 	select {
 	case <-pf.Ready:
 		return pf.ports, nil
+	default:
+		return nil, fmt.Errorf("listeners not ready")
+	}
+}
+
+// GetPortMappings returns a list of forwarded ports, where each entry
+// contains the locally listening (address,port) and corresponding remote
+// port number.
+// It is non-blocking, and will return an error if the Ready channel is nil or
+// if the listeners are not ready yet. This function will succeed only after
+// the Ready channel has been closed.
+func (pf *PortForwarder) GetPortMappings() ([]ForwardedPortMapping, error) {
+	if pf.Ready == nil {
+		return nil, fmt.Errorf("no Ready channel provided")
+	}
+	select {
+	case <-pf.Ready:
+		return pf.portMappings, nil
 	default:
 		return nil, fmt.Errorf("listeners not ready")
 	}

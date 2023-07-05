@@ -138,13 +138,17 @@ func NewCmdPortForwardWithOpts(f cmdutil.Factory, streams genericiooptions.IOStr
 
 // adapter for client-go tools.portforward.ForwardedPort
 type forwardedPort struct {
-	Local  uint16
-	Remote uint16
+	LocalPort  uint16
+	LocalProtocol string
+	LocalAddress string
+	RemotePort uint16
+	// To be filled locally?
+	RemotePortName string
 }
 
 type portForwarder interface {
 	ForwardPorts(method string, url *url.URL, opts PortForwardOptions) error
-	GetPorts() ([]forwardedPort, error)
+	GetPortMappings() ([]forwardedPort, error)
 }
 
 type defaultPortForwarder struct {
@@ -165,16 +169,18 @@ func (f *defaultPortForwarder) ForwardPorts(method string, url *url.URL, opts Po
 	return f.fw.ForwardPorts()
 }
 
-// wrap portforward.GetPorts
-func (f *defaultPortForwarder) GetPorts() ([]forwardedPort, error) {
-	ports, err := f.fw.GetPorts()
+// wrap portforward.GetPortMappings
+func (f *defaultPortForwarder) GetPortMappings() ([]forwardedPort, error) {
+	ports, err := f.fw.GetPortMappings()
 	if err != nil {
 		return []forwardedPort{}, err
 	}
 	r := make([]forwardedPort, len(ports))
 	for i := range ports {
-		r[i].Local = ports[i].Local
-		r[i].Remote = ports[i].Remote
+		r[i].LocalPort = ports[i].LocalPort
+		r[i].LocalProtocol = ports[i].LocalProtocol
+		r[i].LocalAddress = ports[i].LocalAddress
+		r[i].RemotePort = ports[i].RemotePort
 	}
 	return r, nil
 }
@@ -484,7 +490,7 @@ func (o *PortForwardOptions) outputPortForwardsMapping() (chan struct{}, error) 
 		defer close(portsFileDoneChan)
 		defer closer()
 		_ = <- o.ReadyChannel
-		ports, err := o.PortForwarder.GetPorts()
+		ports, err := o.PortForwarder.GetPortMappings()
 		if err != nil {
 			klog.V(2).Infof("error waiting for port-forward to be ready: %v\n", err)
 			return
