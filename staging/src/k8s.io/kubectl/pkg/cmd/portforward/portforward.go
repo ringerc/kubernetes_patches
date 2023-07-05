@@ -59,6 +59,7 @@ type PortForwardOptions struct {
 	PodClient     corev1client.PodsGetter
 	Address       []string
 	Ports         []string
+	PortNames     []string
 	PortForwarder portForwarder
 	StopChannel   chan struct{}
 	ReadyChannel  chan struct{}
@@ -169,7 +170,7 @@ func (f *defaultPortForwarder) ForwardPorts(method string, url *url.URL, opts Po
 	return f.fw.ForwardPorts()
 }
 
-// wrap portforward.GetPortMappings
+// wrap portforward.GetPortMappings for the mockable portforwarder abstraction
 func (f *defaultPortForwarder) GetPortMappings() ([]forwardedPort, error) {
 	ports, err := f.fw.GetPortMappings()
 	if err != nil {
@@ -366,6 +367,8 @@ func (o *PortForwardOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, arg
 	}
 
 	o.PodName = forwardablePod.Name
+	// Record original ports before service and named-to-numeric translation
+	o.PortNames = args[1:]
 
 	// handle service port mapping to target port if needed
 	switch t := obj.(type) {
@@ -494,6 +497,26 @@ func (o *PortForwardOptions) outputPortForwardsMapping() (chan struct{}, error) 
 		if err != nil {
 			klog.V(2).Infof("error waiting for port-forward to be ready: %v\n", err)
 			return
+		}
+		// The PortForwarder only knows about numeric port mappings
+		// after port name resolution and service port remapping.
+		// Find the originally requested port name or service port
+		// number from the client so the client can easily determine
+		// which output port mappings correspond to each port it
+		// requested.
+		for mappingIndex := range ports {
+			// o.Ports and o.PortNames correspond 1:1 so find the
+			// o.Port corresponding to the resulting mapping, and
+			// look up the original name or port number.
+			for i, p := range o.Ports {
+				_, rs := splitPort(p)
+				rp, _ := strconv.Atoi(rs)
+				if int(ports[mappingIndex].RemotePort) == rp {
+					_, rn := splitPort(o.PortNames[i])
+					ports[mappingIndex].RemotePortName = rn
+					break;
+				}
+			}
 		}
 		encoder := json.NewEncoder(ow)
 		if err := encoder.Encode(ports); err != nil {
