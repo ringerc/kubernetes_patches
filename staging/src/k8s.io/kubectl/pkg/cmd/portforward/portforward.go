@@ -64,6 +64,7 @@ type PortForwardOptions struct {
 	StopChannel   chan struct{}
 	ReadyChannel  chan struct{}
 	PortsFile     string
+	Quiet         bool
 	genericiooptions.IOStreams
 }
 
@@ -130,7 +131,8 @@ func NewCmdPortForwardWithOpts(f cmdutil.Factory, streams genericiooptions.IOStr
 	}
 	cmdutil.AddPodRunningTimeoutFlag(cmd, defaultPodPortForwardWaitTimeout)
 	cmd.Flags().StringSliceVar(&opts.Address, "address", []string{"localhost"}, "Addresses to listen on (comma separated). Only accepts IP addresses or localhost as a value. When localhost is supplied, kubectl will try to bind on both 127.0.0.1 and ::1 and will fail if neither of these addresses are available to bind.")
-	cmd.Flags().StringVar(&opts.PortsFile, "ports-file", "", "Write a json-format list of mapped ports to this file. Use - for stdout. Only written once all requested ports are mapped.")
+	cmd.Flags().StringVar(&opts.PortsFile, "ports-file", "", "Write a json-format list of mapped ports to this file then close it. Use - for stdout or /dev/fd/{fdno} for file descriptor. Only written once all requested ports are mapped.")
+	cmd.Flags().BoolVar(&opts.Quiet, "quiet", false, "Do not print progress or mapped port information to stdout.")
 	cmd.SetOut(streams.Out)
 	cmd.SetErr(streams.ErrOut)
 	// TODO support UID
@@ -163,7 +165,11 @@ func (f *defaultPortForwarder) ForwardPorts(method string, url *url.URL, opts Po
 		return err
 	}
 	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, method, url)
-	f.fw, err = portforward.NewOnAddresses(dialer, opts.Address, opts.Ports, opts.StopChannel, opts.ReadyChannel, f.Out, f.ErrOut)
+	out := f.Out
+	if opts.Quiet {
+		out = io.Discard
+	}
+	f.fw, err = portforward.NewOnAddresses(dialer, opts.Address, opts.Ports, opts.StopChannel, opts.ReadyChannel, out, f.ErrOut)
 	if err != nil {
 		return err
 	}
