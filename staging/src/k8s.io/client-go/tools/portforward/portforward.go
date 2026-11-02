@@ -546,8 +546,8 @@ func (pf *PortForwarder) handleConnection(conn net.Conn, port ForwardedPort) {
 		runtime.HandleErrorWithLogger(pf.logger, errResult.err, "Error reading from error stream", "localPort", port.Local, "remotePort", port.Remote)
 		pf.streamConn.Close()
 	case len(errResult.message) > 0:
+		// Scoped to this connection: other forwarded connections must keep working.
 		runtime.HandleErrorWithLogger(pf.logger, errors.New(string(errResult.message)), "An error occurred forwarding", "localPort", port.Local, "remotePort", port.Remote)
-		pf.streamConn.Close()
 	}
 }
 
