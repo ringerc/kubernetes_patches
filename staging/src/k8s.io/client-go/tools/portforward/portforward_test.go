@@ -19,6 +19,7 @@ package portforward
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -60,6 +61,16 @@ func newFakeConnection() *fakeConnection {
 		dataStream:  &fakeStream{},
 		errorStream: &fakeStream{},
 	}
+}
+
+// newFakeRemoteConnection returns a remote with no data to send, that discards
+// what it receives and reports errorMessage on the error stream.
+func newFakeRemoteConnection(errorMessage string) *fakeConnection {
+	c := newFakeConnection()
+	c.dataStream.readFunc = bytes.NewBufferString("").Read
+	c.dataStream.writeFunc = io.Discard.Write
+	c.errorStream.readFunc = bytes.NewBufferString(errorMessage).Read
+	return c
 }
 
 func (c *fakeConnection) CreateStream(headers http.Header) (httpstream.Stream, error) {
@@ -534,13 +545,9 @@ func TestHandleConnectionSendsRemoteError(t *testing.T) {
 	}
 
 	// Setup fake remote connection to return an error message on the error stream
-	remoteDataToSend := bytes.NewBufferString("")
 	remoteDataReceived := bytes.NewBufferString("")
-	remoteErrorToSend := bytes.NewBufferString("error")
-	remoteConnection := newFakeConnection()
-	remoteConnection.dataStream.readFunc = remoteDataToSend.Read
+	remoteConnection := newFakeRemoteConnection("error")
 	remoteConnection.dataStream.writeFunc = remoteDataReceived.Write
-	remoteConnection.errorStream.readFunc = remoteErrorToSend.Read
 	pf.streamConn = remoteConnection
 
 	// Test handleConnection, using go-routine because it needs to be able to write to unbuffered pf.errorChan
@@ -550,6 +557,26 @@ func TestHandleConnectionSendsRemoteError(t *testing.T) {
 	assert.Equal(t, "", remoteDataReceived.String())
 	assert.Equal(t, "", localConnection.receiveBuffer.String())
 	assert.Equal(t, "Handling connection for 1111\n", out.String())
+}
+
+func TestHandleConnectionRemoteErrorKeepsSessionOpen(t *testing.T) {
+	pf, err := New(&fakeDialer{}, []string{":2222"}, nil, nil, bytes.NewBufferString(""), bytes.NewBufferString(""))
+	if err != nil {
+		t.Fatalf("error while calling New: %s", err)
+	}
+
+	localConnection := &fakeConn{
+		sendBuffer:    bytes.NewBufferString(""),
+		receiveBuffer: bytes.NewBufferString(""),
+	}
+
+	// The remote reports an error for this one connection only.
+	remoteConnection := newFakeRemoteConnection("error")
+	pf.streamConn = remoteConnection
+
+	pf.handleConnection(localConnection, ForwardedPort{Local: 1111, Remote: 2222})
+
+	assert.False(t, remoteConnection.closed, "an error on one forwarded connection must not close the session shared by the others")
 }
 
 func TestWaitForConnectionExitsOnStreamConnClosed(t *testing.T) {
