@@ -650,6 +650,48 @@ func TestHandleConnectionRemoteErrorResetsLocalClient(t *testing.T) {
 	}
 }
 
+// The server can only report a forwarding error as free text on the error
+// stream, so a dead pod or runtime failure looks the same to the client as a
+// target reset. A failed forward must end the session so that kubectl exits
+// instead of listening on a port that no longer works.
+func TestForwardPortsReturnsErrorWhenForwardingFails(t *testing.T) {
+	remote := newFakeRemoteConnection("error forwarding port 2222 to pod abc, uid def: sandbox not found")
+	dialer := &fakeDialer{
+		conn:               remote,
+		negotiatedProtocol: PortForwardProtocolV1Name,
+	}
+
+	pf, err := New(dialer, []string{"0:2222"}, make(chan struct{}), make(chan struct{}), io.Discard, io.Discard)
+	if err != nil {
+		t.Fatalf("failed to create new PortForwarder: %s", err)
+	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- pf.ForwardPorts()
+	}()
+
+	<-pf.Ready
+	ports, err := pf.GetPorts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", ports[0].Local))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	select {
+	case err := <-errChan:
+		if !errors.Is(err, ErrLostConnectionToPod) {
+			t.Errorf("ForwardPorts returned %v, expected %v", err, ErrLostConnectionToPod)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ForwardPorts kept running after forwarding failed; kubectl would hang on a dead pod")
+	}
+}
+
 func TestWaitForConnectionExitsOnStreamConnClosed(t *testing.T) {
 	out := bytes.NewBufferString("")
 	errOut := bytes.NewBufferString("")
