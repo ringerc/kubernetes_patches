@@ -26,6 +26,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -577,6 +578,33 @@ func TestHandleConnectionRemoteErrorKeepsSessionOpen(t *testing.T) {
 	pf.handleConnection(localConnection, ForwardedPort{Local: 1111, Remote: 2222})
 
 	assert.False(t, remoteConnection.closed, "an error on one forwarded connection must not close the session shared by the others")
+}
+
+// resetConn fails reads like a local client that aborted with a TCP RST.
+type resetConn struct {
+	fakeConn
+}
+
+func (resetConn) Read(p []byte) (int, error) { return 0, syscall.ECONNRESET }
+
+func TestHandleConnectionLocalResetKeepsSessionOpen(t *testing.T) {
+	pf, err := New(&fakeDialer{}, []string{":2222"}, nil, nil, bytes.NewBufferString(""), bytes.NewBufferString(""))
+	if err != nil {
+		t.Fatalf("error while calling New: %s", err)
+	}
+
+	localConnection := resetConn{fakeConn{
+		sendBuffer:    bytes.NewBufferString(""),
+		receiveBuffer: bytes.NewBufferString(""),
+	}}
+
+	// The remote has nothing to report: the abort is purely client-side.
+	remoteConnection := newFakeRemoteConnection("")
+	pf.streamConn = remoteConnection
+
+	pf.handleConnection(localConnection, ForwardedPort{Local: 1111, Remote: 2222})
+
+	assert.False(t, remoteConnection.closed, "a local client reset must not close the session shared by the other connections")
 }
 
 func TestWaitForConnectionExitsOnStreamConnClosed(t *testing.T) {
