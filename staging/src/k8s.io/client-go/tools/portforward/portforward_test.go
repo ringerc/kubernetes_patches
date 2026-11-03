@@ -18,6 +18,7 @@ package portforward
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -605,6 +606,48 @@ func TestHandleConnectionLocalResetKeepsSessionOpen(t *testing.T) {
 	pf.handleConnection(localConnection, ForwardedPort{Local: 1111, Remote: 2222})
 
 	assert.False(t, remoteConnection.closed, "a local client reset must not close the session shared by the other connections")
+}
+
+// A target that resets the connection is reported on the error stream. The
+// local client should see that as a reset, not as a clean end of stream that
+// looks like a complete, successful response.
+func TestHandleConnectionRemoteErrorResetsLocalClient(t *testing.T) {
+	pf, err := New(&fakeDialer{}, []string{":2222"}, nil, nil, bytes.NewBufferString(""), bytes.NewBufferString(""))
+	if err != nil {
+		t.Fatalf("error while calling New: %s", err)
+	}
+
+	pf.streamConn = newFakeRemoteConnection("error forwarding port 2222: connection reset by peer")
+
+	// Real loopback TCP: fakeConn cannot distinguish FIN from RST.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pf.handleConnection(server, ForwardedPort{Local: 1111, Remote: 2222})
+
+	if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Read(make([]byte, 1))
+	switch {
+	case errors.Is(err, syscall.ECONNRESET):
+	case errors.Is(err, io.EOF):
+		t.Error("local client got a clean EOF after the remote end failed; expected ECONNRESET")
+	default:
+		t.Errorf("local client read: got %v, expected ECONNRESET", err)
+	}
 }
 
 func TestWaitForConnectionExitsOnStreamConnClosed(t *testing.T) {

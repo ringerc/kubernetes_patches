@@ -544,10 +544,22 @@ func (pf *PortForwarder) handleConnection(conn net.Conn, port ForwardedPort) {
 	switch {
 	case errResult.err != nil:
 		runtime.HandleErrorWithLogger(pf.logger, errResult.err, "Error reading from error stream", "localPort", port.Local, "remotePort", port.Remote)
+		resetOnClose(conn)
 		pf.streamConn.Close()
 	case len(errResult.message) > 0:
 		// Scoped to this connection: other forwarded connections must keep working.
 		runtime.HandleErrorWithLogger(pf.logger, errors.New(string(errResult.message)), "An error occurred forwarding", "localPort", port.Local, "remotePort", port.Remote)
+		resetOnClose(conn)
+	}
+}
+
+// resetOnClose makes a later Close send a TCP RST instead of a FIN. The local
+// handshake completed before the remote side was dialled, so a reset is the
+// only way to tell the local client that the forward failed rather than
+// ended cleanly.
+func resetOnClose(conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetLinger(0)
 	}
 }
 
