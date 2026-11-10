@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	streamhttp "k8s.io/streaming/pkg/httpstream"
+	"k8s.io/streaming/pkg/portforward/pferrors"
 	netutils "k8s.io/utils/net"
 )
 
@@ -546,8 +547,24 @@ func (pf *PortForwarder) handleConnection(conn net.Conn, port ForwardedPort) {
 		runtime.HandleErrorWithLogger(pf.logger, errResult.err, "Error reading from error stream", "localPort", port.Local, "remotePort", port.Remote)
 		pf.streamConn.Close()
 	case len(errResult.message) > 0:
-		runtime.HandleErrorWithLogger(pf.logger, errors.New(string(errResult.message)), "An error occurred forwarding", "localPort", port.Local, "remotePort", port.Remote)
-		pf.streamConn.Close()
+		message := string(errResult.message)
+		runtime.HandleErrorWithLogger(pf.logger, errors.New(message), "An error occurred forwarding", "localPort", port.Local, "remotePort", port.Remote)
+		// The local client must not see a clean EOF that looks like a
+		// complete response.
+		resetOnClose(conn)
+		// Only errors the server classified as specific to this connection
+		// leave the session usable. Anything else, including servers that do
+		// not classify, may mean the pod is gone, so end the session.
+		if pferrors.ClassifyMessage(message).SessionFatal() {
+			pf.streamConn.Close()
+		}
+	}
+}
+
+// resetOnClose makes the next Close of conn send a TCP RST instead of a FIN.
+func resetOnClose(conn net.Conn) {
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0)
 	}
 }
 
