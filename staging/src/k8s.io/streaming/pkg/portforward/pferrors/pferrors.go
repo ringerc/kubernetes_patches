@@ -166,3 +166,14 @@ func (r Reason) SessionFatal() bool {
 	}
 	return true
 }
+
+// IsSandboxNotAvailable reports whether err is classified as ReasonSandboxNotAvailable.
+func IsSandboxNotAvailable(err error) bool { return Classify(err) == ReasonSandboxNotAvailable }
+
+// IsTargetConnectionRefused reports whether err is classified as ReasonTargetConnectionRefused.
+func IsTargetConnectionRefused(err error) bool {
+	return Classify(err) == ReasonTargetConnectionRefused
+}
+
+// IsTargetConnectionReset reports whether err is classified as ReasonTargetConnectionReset.
+func IsTargetConnectionReset(err error) bool { return Classify(err) == ReasonTargetConnectionReset }

@@ -151,3 +151,22 @@ func TestWrap(t *testing.T) {
 		t.Errorf("Wrap lost sentinel or cause: %v", wrapped)
 	}
 }
+
+func TestPredicates(t *testing.T) {
+	preds := map[Reason]func(error) bool{
+		ReasonSandboxNotAvailable:     IsSandboxNotAvailable,
+		ReasonTargetConnectionRefused: IsTargetConnectionRefused,
+		ReasonTargetConnectionReset:   IsTargetConnectionReset,
+	}
+	for _, tc := range allReasons {
+		err := fmt.Errorf("outer: %w", tc.newErr(errors.New("x")))
+		for reason, pred := range preds {
+			if got, want := pred(err), reason == tc.reason; got != want {
+				t.Errorf("predicate for %s on %s error = %v, want %v", reason, tc.reason, got, want)
+			}
+		}
+	}
+	if IsTargetConnectionReset(nil) || IsTargetConnectionReset(errors.New("x")) {
+		t.Error("predicate matched an unclassified error")
+	}
+}
