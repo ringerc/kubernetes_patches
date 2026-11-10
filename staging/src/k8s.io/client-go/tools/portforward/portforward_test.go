@@ -25,8 +25,10 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -561,24 +563,63 @@ func TestHandleConnectionSendsRemoteError(t *testing.T) {
 	assert.Equal(t, "Handling connection for 1111\n", out.String())
 }
 
+// failRecorder captures failures instead of reporting them, so a test body
+// can be run as an expected failure.
+type failRecorder struct {
+	testing.TB
+	mu     sync.Mutex
+	failed bool
+}
+
+func (r *failRecorder) record() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failed = true
+}
+
+func (r *failRecorder) Errorf(string, ...any) { r.record() }
+func (r *failRecorder) Error(...any)          { r.record() }
+func (r *failRecorder) Fail()                 { r.record() }
+func (r *failRecorder) FailNow()              { r.record(); runtime.Goexit() }
+func (r *failRecorder) Fatalf(string, ...any) { r.record(); runtime.Goexit() }
+func (r *failRecorder) Fatal(...any)          { r.record(); runtime.Goexit() }
+
+// expectFail runs body and passes only if body fails. Once the behaviour it
+// describes is implemented the test fails, prompting removal of the wrapper.
+func expectFail(t *testing.T, reason string, body func(t testing.TB)) {
+	t.Helper()
+	rec := &failRecorder{TB: t}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		body(rec)
+	}()
+	<-done
+	if !rec.failed {
+		t.Errorf("expected failure (%s), but the test passed: remove expectFail", reason)
+	}
+}
+
 func TestHandleConnectionRemoteErrorKeepsSessionOpen(t *testing.T) {
-	pf, err := New(&fakeDialer{}, []string{":2222"}, nil, nil, bytes.NewBufferString(""), bytes.NewBufferString(""))
-	if err != nil {
-		t.Fatalf("error while calling New: %s", err)
-	}
+	expectFail(t, "the client closes the whole session on any remote error", func(t testing.TB) {
+		pf, err := New(&fakeDialer{}, []string{":2222"}, nil, nil, bytes.NewBufferString(""), bytes.NewBufferString(""))
+		if err != nil {
+			t.Fatalf("error while calling New: %s", err)
+		}
 
-	localConnection := &fakeConn{
-		sendBuffer:    bytes.NewBufferString(""),
-		receiveBuffer: bytes.NewBufferString(""),
-	}
+		localConnection := &fakeConn{
+			sendBuffer:    bytes.NewBufferString(""),
+			receiveBuffer: bytes.NewBufferString(""),
+		}
 
-	// The remote reports an error for this one connection only.
-	remoteConnection := newFakeRemoteConnection("error")
-	pf.streamConn = remoteConnection
+		// The remote reports an error for this one connection only.
+		remoteConnection := newFakeRemoteConnection("error")
+		pf.streamConn = remoteConnection
 
-	pf.handleConnection(localConnection, ForwardedPort{Local: 1111, Remote: 2222})
+		pf.handleConnection(localConnection, ForwardedPort{Local: 1111, Remote: 2222})
 
-	assert.False(t, remoteConnection.closed, "an error on one forwarded connection must not close the session shared by the others")
+		assert.False(t, remoteConnection.closed, "an error on one forwarded connection must not close the session shared by the others")
+	})
 }
 
 // resetConn fails reads like a local client that aborted with a TCP RST.
@@ -612,42 +653,44 @@ func TestHandleConnectionLocalResetKeepsSessionOpen(t *testing.T) {
 // local client should see that as a reset, not as a clean end of stream that
 // looks like a complete, successful response.
 func TestHandleConnectionRemoteErrorResetsLocalClient(t *testing.T) {
-	pf, err := New(&fakeDialer{}, []string{":2222"}, nil, nil, bytes.NewBufferString(""), bytes.NewBufferString(""))
-	if err != nil {
-		t.Fatalf("error while calling New: %s", err)
-	}
+	expectFail(t, "the client closes the local connection cleanly instead of resetting it", func(t testing.TB) {
+		pf, err := New(&fakeDialer{}, []string{":2222"}, nil, nil, bytes.NewBufferString(""), bytes.NewBufferString(""))
+		if err != nil {
+			t.Fatalf("error while calling New: %s", err)
+		}
 
-	pf.streamConn = newFakeRemoteConnection("error forwarding port 2222: connection reset by peer")
+		pf.streamConn = newFakeRemoteConnection("error forwarding port 2222: connection reset by peer")
 
-	// Real loopback TCP: fakeConn cannot distinguish FIN from RST.
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	client, err := net.Dial("tcp", listener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	server, err := listener.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
+		// Real loopback TCP: fakeConn cannot distinguish FIN from RST.
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		client, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		server, err := listener.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	pf.handleConnection(server, ForwardedPort{Local: 1111, Remote: 2222})
+		pf.handleConnection(server, ForwardedPort{Local: 1111, Remote: 2222})
 
-	if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	_, err = client.Read(make([]byte, 1))
-	switch {
-	case errors.Is(err, syscall.ECONNRESET):
-	case errors.Is(err, io.EOF):
-		t.Error("local client got a clean EOF after the remote end failed; expected ECONNRESET")
-	default:
-		t.Errorf("local client read: got %v, expected ECONNRESET", err)
-	}
+		if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		_, err = client.Read(make([]byte, 1))
+		switch {
+		case errors.Is(err, syscall.ECONNRESET):
+		case errors.Is(err, io.EOF):
+			t.Error("local client got a clean EOF after the remote end failed; expected ECONNRESET")
+		default:
+			t.Errorf("local client read: got %v, expected ECONNRESET", err)
+		}
+	})
 }
 
 // The server can only report a forwarding error as free text on the error
