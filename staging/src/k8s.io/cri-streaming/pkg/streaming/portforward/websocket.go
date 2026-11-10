@@ -190,7 +190,7 @@ func (h *websocketStreamHandler) portForward(p *websocketStreamPair) {
 	klog.V(5).InfoS("Connection done invoking forwarder.PortForward for port", "connection", h.conn, "port", p.port)
 
 	if err != nil {
-		msg := fmt.Errorf("error forwarding port %d to pod %s, uid %v: %v", p.port, h.pod, h.uid, err)
+		msg := newForwardError(p.port, h.pod, h.uid, err)
 		runtime.HandleError(msg)
 		fmt.Fprint(p.errorStream, msg.Error())
 	}

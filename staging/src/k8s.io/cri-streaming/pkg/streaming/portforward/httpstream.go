@@ -251,7 +251,7 @@ func (h *httpStreamHandler) portForward(p *httpStreamPair) {
 	klog.V(5).InfoS("Connection request done invoking forwarder.PortForward for port", "connection", h.conn, "request", p.requestID, "port", portString)
 
 	if err != nil {
-		msg := fmt.Errorf("error forwarding port %d to pod %s, uid %v: %v", port, h.pod, h.uid, err)
+		msg := newForwardError(int32(port), h.pod, h.uid, err)
 		utilruntime.HandleError(msg)
 		fmt.Fprint(p.errorStream, msg.Error())
 		// receiving an error from a port-forward operation indicates a problem

@@ -66,6 +66,13 @@ type Runtime interface {
 	// satisfies this contract.
 	Exec(ctx context.Context, containerID string, cmd []string, in io.Reader, out, err io.WriteCloser, tty bool, resize <-chan remotecommandserver.TerminalSize) error
 	Attach(ctx context.Context, containerID string, in io.Reader, out, err io.WriteCloser, tty bool, resize <-chan remotecommandserver.TerminalSize) error
+	// PortForward forwards a data stream to a port in the pod sandbox.
+	//
+	// Failures should be wrapped with the classified errors from
+	// [portforward.NewSandboxNotAvailable] and its siblings, keeping the
+	// original error in the chain. Unwrapped errors that wrap
+	// `syscall.ECONNREFUSED` or `syscall.ECONNRESET` are classified
+	// automatically.
 	PortForward(ctx context.Context, podSandboxID string, port int32, stream io.ReadWriteCloser) error
 }
 

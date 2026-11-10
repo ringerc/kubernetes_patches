@@ -18,11 +18,13 @@ package portforward
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
 
 	"k8s.io/streaming/pkg/httpstream/wsstream"
+	"k8s.io/streaming/pkg/portforward/pferrors"
 	"k8s.io/streaming/pkg/runtime"
 )
 
@@ -30,6 +32,12 @@ import (
 // in a pod.
 type PortForwarder interface {
 	// PortForwarder copies data between a data stream and a port in a pod.
+	//
+	// Implementations should wrap failures with the constructors in
+	// k8s.io/streaming/pkg/portforward/pferrors, so that clients can tell the
+	// loss of the pod sandbox from the failure of a single connection to the
+	// target. Errors wrapping ECONNREFUSED or ECONNRESET are classified
+	// automatically. Any error ends only the stream pair it occurred on.
 	PortForward(ctx context.Context, name string, uid string, port int32, stream io.ReadWriteCloser) error
 }
 
@@ -50,4 +58,11 @@ func ServePortForward(w http.ResponseWriter, req *http.Request, portForwarder Po
 		runtime.HandleError(err)
 		return
 	}
+}
+
+// newForwardError describes a failed forward for the client's error stream.
+// The text of a classified error follows the colon, so clients can match it
+// with pferrors.ClassifyMessage. The result wraps err.
+func newForwardError(port int32, pod, uid string, err error) error {
+	return fmt.Errorf("error forwarding port %d to pod %s, uid %v: %w", port, pod, uid, pferrors.Wrap(err))
 }
